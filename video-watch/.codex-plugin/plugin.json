@@ -1,0 +1,39 @@
+{
+  "name": "video-watch",
+  "version": "1.0.0",
+  "description": "Let Codex actually watch a video file: extracts evenly spaced or scene-change frames with ffmpeg so they can be read as images, plus contact sheets for cheap scanning and burned-in timestamps.",
+  "author": {
+    "name": "Gev",
+    "url": "https://github.com/ridelink0"
+  },
+  "homepage": "https://github.com/ridelink0/video-watch",
+  "repository": "https://github.com/ridelink0/video-watch",
+  "license": "MIT",
+  "keywords": [
+    "video",
+    "frames",
+    "ffmpeg",
+    "vision",
+    "screen recording",
+    "scene detection",
+    "contact sheet"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Video Watch",
+    "shortDescription": "Read a video as frames a model can look at",
+    "longDescription": "A model cannot open an .mp4. This extracts frames with ffmpeg - evenly spaced, or cut where the picture actually changes - and hands them back as images, with contact sheets so a long recording is a few pictures instead of forty, timestamps burned into the corner so a frame can be pointed at by time, and a JSON manifest of what actually ran. Zero dependencies beyond ffmpeg and ffprobe on PATH; nothing leaves the machine.",
+    "developerName": "Ridelink",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://github.com/ridelink0/video-watch",
+    "defaultPrompt": [
+      "Watch this screen recording and tell me where it goes wrong",
+      "Pull the key frames out of this demo video",
+      "Make a contact sheet of this clip"
+    ],
+    "brandColor": "#0C0A03"
+  }
+}
