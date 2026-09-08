@@ -1,6 +1,6 @@
 {
   "name": "video-watch",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Let Codex actually watch a video file: extracts evenly spaced or scene-change frames with ffmpeg so they can be read as images, plus contact sheets for cheap scanning and burned-in timestamps.",
   "author": {
     "name": "Gev",

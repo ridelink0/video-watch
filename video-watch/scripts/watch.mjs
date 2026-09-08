@@ -8,7 +8,7 @@
 // as images to actually see the video.
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, readdirSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, readdirSync, renameSync, statSync } from 'node:fs';
 import { join, basename, extname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -227,6 +227,13 @@ times = [...new Set(times.map((t) => +t.toFixed(3)))].sort((a, b) => a - b).slic
 
 const outGiven = argv.includes('--out');
 if (existsSync(outDir)) {
+  // readdirSync on a file throws ENOTDIR, and the guard below was the first
+  // thing to touch it - so --out pointing at a file came back as a raw stack
+  // trace rather than the one-line refusal every other bad argument gets.
+  if (!statSync(outDir).isDirectory()) {
+    console.error(`video-watch: --out ${outDir} exists and is not a directory.`);
+    process.exit(2);
+  }
   // the default tmp/video-watch/<slug> dir is ours to wipe every run, but a
   // user-supplied --out is someone else's directory (an earlier run of this script
   // wiped a project folder this way) - refuse unless it's empty or --force is given

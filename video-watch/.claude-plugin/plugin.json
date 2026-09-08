@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "video-watch",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Let Claude actually watch a video file: extracts evenly spaced or scene-change frames with ffmpeg so they can be read as images, plus contact sheets for cheap scanning.",
   "author": { "name": "Gev", "email": "app.ridelink@gmail.com" },
   "keywords": ["video", "frames", "ffmpeg", "vision", "screen recording"]
