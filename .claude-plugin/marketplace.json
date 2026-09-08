@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "local-plugins",
-  "description": "Locally developed Claude Code plugins",
+  "name": "video-watch",
+  "description": "Let Claude watch a video: ffmpeg frame extraction as readable images.",
   "owner": {
     "name": "Gev",
     "email": "app.ridelink@gmail.com"
@@ -10,7 +10,9 @@
     {
       "name": "video-watch",
       "description": "Let Claude actually watch a video file: extracts evenly spaced or scene-change frames with ffmpeg so they can be read as images, plus contact sheets and audio transcription hooks.",
-      "author": { "name": "Gev" },
+      "author": {
+        "name": "Gev"
+      },
       "category": "productivity",
       "source": "./video-watch"
     }
