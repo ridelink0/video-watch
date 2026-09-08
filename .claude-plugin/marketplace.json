@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "video-watch",
-      "description": "Let Claude actually watch a video file: extracts evenly spaced or scene-change frames with ffmpeg so they can be read as images, plus contact sheets and audio transcription hooks.",
+      "description": "Let Claude actually watch a video file: extracts evenly spaced or scene-change frames with ffmpeg so they can be read as images, plus contact sheets for cheap scanning.",
       "author": {
         "name": "Gev"
       },
