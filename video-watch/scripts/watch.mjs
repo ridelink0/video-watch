@@ -107,10 +107,18 @@ function flag(name, def) {
   return v === undefined || v.startsWith('--') ? true : v;
 }
 
-let n = Math.max(1, parseInt(flag('n', '24'), 10) || 24); // may be capped once fps/span are known
+// `parsed || fallback` treats an explicit 0 the same as "missing" (0 is falsy), so
+// e.g. --threshold 0 - a legitimate "flag every frame as a cut" request - silently
+// became the 0.3 default. Number.isFinite tells "absent/garbage" from "really zero".
+function numFlag(name, def, parseFn) {
+  const parsed = parseFn(flag(name, String(def)));
+  return Number.isFinite(parsed) ? parsed : def;
+}
+
+let n = Math.max(1, numFlag('n', 24, (v) => parseInt(v, 10))); // may be capped once fps/span are known
 const mode = String(flag('mode', 'grid'));
-const width = Math.max(160, parseInt(flag('width', '960'), 10) || 960);
-const threshold = parseFloat(flag('threshold', '0.3')) || 0.3;
+const width = Math.max(160, numFlag('width', 960, (v) => parseInt(v, 10)));
+const threshold = numFlag('threshold', 0.3, parseFloat);
 const wantLabel = argv.includes('--label');
 const asJson = argv.includes('--json');
 const sheetSpec = flag('sheet', null);
@@ -133,7 +141,11 @@ try {
   meta = ffprobeJson([
     '-v', 'error',
     '-select_streams', 'v:0',
-    '-show_entries', 'stream=width,height,avg_frame_rate,codec_name:format=duration,size',
+    // the display matrix lives in a NESTED section: "stream=side_data_list" prints the
+    // section header with every field stripped ("side_data_list":[{}]), so the rotation
+    // has to be asked for as stream_side_data=... or it silently never arrives
+    '-show_entries',
+    'stream=width,height,avg_frame_rate,codec_name:stream_side_data=side_data_type,rotation:stream_tags=rotate:format=duration,size',
     '-of', 'json',
     video,
   ]);
@@ -153,10 +165,20 @@ if (!duration) {
 const [fnum, fden] = String(vs.avg_frame_rate || '0/1').split('/').map(Number);
 const fps = fden ? +(fnum / fden).toFixed(3) : 0;
 
-const fromRaw = parseFloat(flag('from', '0'));
+// --from/--to take plain seconds ("90", "12.5") or a clock ("mm:ss" / "hh:mm:ss",
+// e.g. "1:30" = 90s) - a bare parseFloat("1:30") silently reads only "1" and the run
+// samples the opening seconds while the user believes they asked for ninety.
+function parseTimeSpec(v) {
+  if (v === undefined || v === true) return NaN;
+  const parts = String(v).split(':').map((p) => parseFloat(p));
+  if (!parts.length || parts.some((p) => !Number.isFinite(p))) return NaN;
+  return parts.reduce((secs, p) => secs * 60 + p, 0);
+}
+
+const fromRaw = parseTimeSpec(flag('from', '0'));
 const from = Math.max(0, Number.isFinite(fromRaw) ? fromRaw : 0);
 // Number.isFinite (not ||) so an explicit "--to 0" is honored instead of read as "unset"
-const toRaw = parseFloat(flag('to', String(duration)));
+const toRaw = parseTimeSpec(flag('to', String(duration)));
 const to = Math.min(duration, Number.isFinite(toRaw) ? toRaw : duration);
 if (from >= duration || to <= from) {
   console.error(`video-watch: --from/--to must satisfy 0 <= from < to <= ${duration}`);
@@ -201,17 +223,46 @@ function sceneTimes() {
 
 let times;
 let usedMode = 'grid';
+let sceneStats = null; // how many of the returned frames were real cuts vs. top-up fill
+let cutTimes = new Set(); // the subset of `times` that are real cuts, for the manifest
 if (mode === 'scene') {
-  const found = sceneTimes();
+  const found = [...new Set(sceneTimes().map((t) => +t.toFixed(3)))]
+    .filter((t) => t > from && t < to)
+    .sort((a, b) => a - b);
   if (found.length >= 2) {
     usedMode = 'scene';
-    // keep at most n, evenly sampled across the detected cuts, always include the first frame
-    times = [from + Math.min(0.2, span * 0.01)];
-    if (found.length <= n - 1) times.push(...found);
-    else {
-      const step = found.length / (n - 1);
-      for (let i = 0; i < n - 1; i++) times.push(found[Math.floor(i * step)]);
+    if (found.length >= n) {
+      // more cuts than requested frames: no room to fill, evenly sample n of them
+      const step = found.length / n;
+      times = Array.from({ length: n }, (_, i) => found[Math.floor(i * step)]);
+    } else {
+      // a clip that changes slowly between two cuts previously returned nothing for
+      // that whole stretch - keep every cut, then spend the rest of the budget on the
+      // largest gaps (including the run-in before the first cut and run-out after the
+      // last) so a static-looking span still gets sampled instead of skipped entirely
+      const fillCount = n - found.length;
+      const anchors = [from, ...found, to];
+      const gaps = anchors.slice(1).map((end, i) => ({ start: anchors[i], end, size: end - anchors[i] }));
+      gaps.sort((a, b) => b.size - a.size);
+      const totalGapSize = gaps.reduce((s, g) => s + g.size, 0) || 1;
+      // largest-remainder, not per-gap rounding: rounding each share independently can
+      // hand out MORE frames than the budget (six equal gaps sharing three fills each
+      // round 0.5 up to 1), and the surplus was then chopped off the end of the sorted
+      // timestamps - silently discarding real cuts while the manifest still claimed them
+      const exact = gaps.map((g) => (g.size / totalGapSize) * fillCount);
+      const alloc = exact.map(Math.floor);
+      const order = exact
+        .map((e, i) => ({ i, frac: e - Math.floor(e) }))
+        .sort((a, b) => b.frac - a.frac || a.i - b.i); // ties go to the larger gap (gaps are size-sorted)
+      let left = fillCount - alloc.reduce((a, b) => a + b, 0);
+      for (let k = 0; left > 0; k++, left--) alloc[order[k % order.length].i]++;
+      const fillTimes = [];
+      gaps.forEach((g, i) => {
+        for (let j = 1; j <= alloc[i]; j++) fillTimes.push(g.start + (g.end - g.start) * (j / (alloc[i] + 1)));
+      });
+      times = [...found, ...fillTimes];
     }
+    cutTimes = new Set(times.filter((t) => found.includes(t)).map((t) => +t.toFixed(3)));
   } else {
     console.error(`video-watch: scene mode found ${found.length} cuts, falling back to grid`);
     times = null;
@@ -255,16 +306,53 @@ const FONT =
       ? '/System/Library/Fonts/Supplemental/Courier New.ttf'
       : '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf';
 
-// --width names the long edge, not literally "width": a portrait clip should sample
-// onto its (taller) height axis instead of being stretched wide, and should never be
-// upscaled past the source's own long edge
-const vw = vs.width || 0;
-const vh = vs.height || 0;
+// phone/screen recordings are routinely stored landscape with a rotation telling the
+// player to turn them 90 or 270 degrees for display - the CODED width/height above
+// describe the stored pixels, not what a viewer sees, so orientation and scale must use
+// the DISPLAY size. ffmpeg carries the rotation two ways: a Display Matrix side_data
+// entry (mp4/mov, and what every current ffmpeg writes) or a legacy "rotate" stream tag
+// (older mp4 muxers, matroska). Side data wins when both are present: it is what ffmpeg's
+// own autorotate acts on, so trusting it keeps us in step with the decoder.
+//
+// Signs, measured against ffmpeg's autorotate output (ffmpeg 9, mp4 display matrix):
+// side_data rotation +90 needs a 90 counter-clockwise turn to display, -90 needs 90
+// clockwise, -180 needs 180 - i.e. the clockwise turn we owe is -rotation. The legacy
+// tag uses the opposite sign (rotate=90 means "turn 90 clockwise"), which is why the
+// two branches differ.
+function getRotation(stream) {
+  const norm = (deg) => ((Math.round(deg) % 360) + 360) % 360;
+  const dm = (stream.side_data_list || []).find((s) => typeof s.rotation === 'number');
+  if (dm) return norm(-dm.rotation);
+  const tag = stream.tags && (stream.tags.rotate ?? stream.tags.ROTATE);
+  if (tag !== undefined && Number.isFinite(parseInt(tag, 10))) return norm(parseInt(tag, 10));
+  return 0;
+}
+const rotation = getRotation(vs); // one of 0, 90, 180, 270 - the clockwise turn needed to view it upright
+const swapped = rotation === 90 || rotation === 270;
+const codedW = vs.width || 0;
+const codedH = vs.height || 0;
+// display dims are what orientation/scale decisions must use; coded dims are only for
+// the transpose filter below, which runs on the coded frame before it's swapped
+const vw = swapped ? codedH : codedW;
+const vh = swapped ? codedW : codedH;
 const portrait = vh > vw;
 function frameScale(w) {
   if (!vw || !vh) return `scale=${w}:-2`; // dimensions unknown - fall back to the old behavior
   const target = Math.min(w, Math.max(vw, vh));
   return portrait ? `scale=-2:${target}` : `scale=${target}:-2`;
+}
+// Rotate explicitly rather than leaning on ffmpeg's autorotate: autorotate ignores the
+// legacy "rotate" tag (matroska), and the frameScale math above is written in display
+// terms, so the two must not disagree about whether the frame arrived turned. When this
+// returns a filter, extract() also passes -noautorotate so the turn happens exactly once.
+// When it returns null - no rotation, or an odd angle that is not a quarter turn -
+// autorotate is left alone, so an angle we failed to read still comes out upright
+// (merely mis-scaled) instead of sideways.
+function rotateFilter() {
+  if (rotation === 90) return 'transpose=1'; // 90 clockwise
+  if (rotation === 270) return 'transpose=2'; // 90 counter-clockwise
+  if (rotation === 180) return 'transpose=2,transpose=2';
+  return null;
 }
 
 // ffmpeg's filtergraph parser treats ':' as an option separator even inside a quoted
@@ -284,7 +372,10 @@ function stamp(t) {
 }
 
 function extract(t, file, label) {
-  const vf = [frameScale(width)];
+  const rf = rotateFilter();
+  const vf = [];
+  if (rf) vf.push(rf); // rotate first - scale/crop math below is all in display-orientation terms
+  vf.push(frameScale(width));
   if (label) {
     vf.push(
       `drawtext=fontfile='${FONT}':text='${escapeDrawtext(label)}':x=10:y=10:fontsize=22:` +
@@ -293,7 +384,9 @@ function extract(t, file, label) {
   }
   const r = spawnSync(
     FFMPEG,
-    ['-hide_banner', '-loglevel', 'error', '-ss', String(t), '-i', video,
+    ['-hide_banner', '-loglevel', 'error',
+     ...(rf ? ['-noautorotate'] : []), // input option: must precede -i
+     '-ss', String(t), '-i', video,
      '-frames:v', '1', '-vf', vf.join(','), '-q:v', '3', '-y', file],
     { encoding: 'utf8' },
   );
@@ -356,13 +449,24 @@ if (sheetSpec) {
 
 /* ---------- report ---------- */
 
+// counted from the frames that were really written, after the dedupe, the --n cap and
+// any failed extract - a manifest that claims cuts the caller cannot look at is worse
+// than no manifest at all
+if (usedMode === 'scene') {
+  const cuts = frames.filter((f) => cutTimes.has(f.t)).length;
+  sceneStats = { cuts, fill: frames.length - cuts };
+}
+
 const report = {
   video,
   duration: +duration.toFixed(2),
-  size: `${vs.width}x${vs.height}`,
+  size: `${vw}x${vh}`, // display size (post-rotation), what the frames actually look like
+  codedSize: rotation ? `${codedW}x${codedH}` : undefined,
+  rotation: rotation || undefined,
   fps,
   codec: vs.codec_name,
   mode: usedMode,
+  sceneStats: sceneStats || undefined, // {cuts, fill} - only meaningful when mode === 'scene'
   outDir,
   labels: labelOk,
   frames: frames.map((f) => ({ n: f.i, t: f.t, at: stamp(f.t), file: f.file })),
@@ -372,10 +476,14 @@ const report = {
 if (asJson) {
   console.log(JSON.stringify(report, null, 2));
 } else {
+  const rot = report.rotation
+    ? `  [rotated ${report.rotation} clockwise from ${report.codedSize}]`
+    : '';
   console.log(
-    `${basename(video)}  ${report.size} @ ${fps}fps  ${report.duration}s  (${report.codec})`,
+    `${basename(video)}  ${report.size} @ ${fps}fps  ${report.duration}s  (${report.codec})${rot}`,
   );
-  console.log(`${frames.length} frames [${report.mode}] -> ${outDir}`);
+  const sceneNote = sceneStats ? ` (${sceneStats.cuts} cuts + ${sceneStats.fill} fill)` : '';
+  console.log(`${frames.length} frames [${report.mode}]${sceneNote} -> ${outDir}`);
   if (sheets.length) {
     console.log(`\nContact sheets (read these first):`);
     for (const s of sheets) {
