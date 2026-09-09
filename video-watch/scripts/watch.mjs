@@ -176,10 +176,19 @@ function parseTimeSpec(v) {
 }
 
 const fromRaw = parseTimeSpec(flag('from', '0'));
-const from = Math.max(0, Number.isFinite(fromRaw) ? fromRaw : 0);
-// Number.isFinite (not ||) so an explicit "--to 0" is honored instead of read as "unset"
 const toRaw = parseTimeSpec(flag('to', String(duration)));
-const to = Math.min(duration, Number.isFinite(toRaw) ? toRaw : duration);
+// A time that cannot be read is refused rather than replaced with a default: falling back
+// silently samples a different window than the caller asked for, which is the same
+// failure "--from 1:30" used to produce - loudly wrong beats quietly wrong.
+for (const [name, raw] of [['from', fromRaw], ['to', toRaw]]) {
+  if (Number.isFinite(raw)) continue;
+  console.error(`video-watch: --${name} is not a time (use ss, mm:ss or hh:mm:ss)`);
+  process.exit(2);
+}
+// plain assignment, not `raw || default`: an explicit "--to 0" is a real zero and must
+// reach the range check below instead of being read as "unset"
+const from = Math.max(0, fromRaw);
+const to = Math.min(duration, toRaw);
 if (from >= duration || to <= from) {
   console.error(`video-watch: --from/--to must satisfy 0 <= from < to <= ${duration}`);
   process.exit(2);
@@ -188,15 +197,25 @@ const span = to - from;
 
 // a --n above the real frame count spawns one ffmpeg per timestamp for no benefit -
 // the extra timestamps land between frames and just duplicate the nearest one
-if (fps > 0) {
-  const maxFrames = Math.max(1, Math.floor(span * fps));
-  if (n > maxFrames) {
-    console.error(
-      `video-watch: --n ${n} exceeds the ~${maxFrames} distinct frames available in this range at ${fps}fps, capping to ${maxFrames}`,
-    );
-    n = maxFrames;
-  }
+const maxFrames = fps > 0 ? Math.max(1, Math.floor(span * fps)) : 0; // 0 = fps unknown
+if (maxFrames && n > maxFrames) {
+  console.error(
+    `video-watch: --n ${n} exceeds the ~${maxFrames} distinct frames available in this range at ${fps}fps, capping to ${maxFrames}`,
+  );
+  n = maxFrames;
 }
+
+// ffmpeg's -ss rounds FORWARD: it hands back the first frame whose pts is at or after the
+// timestamp, and if there is none (the request sits past the last frame) it decodes
+// nothing at all and writes no file - a frame that was counted but never delivered. That
+// is why "capping to 20" used to return 19: the last evenly spaced sample of a 2s 10fps
+// clip is 1.95s, half a frame past the final frame at 1.9s.
+// So sampling is done in FRAME INDEX space whenever the fps is known: pick frame k, then
+// ask for it half a frame early, which is inside frame k under any rounding and can never
+// run off the end of the clip. maxFrames may over-count by one on a VFR source; the half
+// frame of backoff absorbs that too.
+const frameTime = (k) => from + Math.max(0, Math.min(k, maxFrames - 1) - 0.5) / fps;
+const snapToFrame = (t) => (maxFrames ? frameTime(Math.round((t - from) * fps)) : t);
 
 /* ---------- pick timestamps ---------- */
 
@@ -231,16 +250,22 @@ if (mode === 'scene') {
     .sort((a, b) => a - b);
   if (found.length >= 2) {
     usedMode = 'scene';
-    if (found.length >= n) {
-      // more cuts than requested frames: no room to fill, evenly sample n of them
-      const step = found.length / n;
-      times = Array.from({ length: n }, (_, i) => found[Math.floor(i * step)]);
+    if (found.length >= n - 1) {
+      // More cuts than there is room to fill around. A detected cut is the FIRST frame of
+      // the scene AFTER it, so sampling only cuts never shows the opening scene at all -
+      // this branch is the one where no fill is allocated to the run-in either, so it
+      // keeps a head frame (as this script always did) and spends the rest on cuts.
+      // Offset off the exact start for the usual reason: frame 0 is often black.
+      const head = from + Math.min(0.2, span * 0.01);
+      const keep = n - 1;
+      const step = found.length / keep;
+      times = [head, ...Array.from({ length: keep }, (_, i) => found[Math.floor(i * step)])];
     } else {
       // a clip that changes slowly between two cuts previously returned nothing for
       // that whole stretch - keep every cut, then spend the rest of the budget on the
       // largest gaps (including the run-in before the first cut and run-out after the
       // last) so a static-looking span still gets sampled instead of skipped entirely
-      const fillCount = n - found.length;
+      const fillCount = n - found.length; // the run-in gap below is what samples the opening scene
       const anchors = [from, ...found, to];
       const gaps = anchors.slice(1).map((end, i) => ({ start: anchors[i], end, size: end - anchors[i] }));
       gaps.sort((a, b) => b.size - a.size);
@@ -258,7 +283,10 @@ if (mode === 'scene') {
       for (let k = 0; left > 0; k++, left--) alloc[order[k % order.length].i]++;
       const fillTimes = [];
       gaps.forEach((g, i) => {
-        for (let j = 1; j <= alloc[i]; j++) fillTimes.push(g.start + (g.end - g.start) * (j / (alloc[i] + 1)));
+        // snapped for the same reason the grid is: the midpoint of a gap only one frame
+        // wide sits past the last frame of that gap, where ffmpeg decodes nothing and the
+        // fill silently never arrives
+        for (let j = 1; j <= alloc[i]; j++) fillTimes.push(snapToFrame(g.start + (g.end - g.start) * (j / (alloc[i] + 1))));
       });
       times = [...found, ...fillTimes];
     }
@@ -269,8 +297,13 @@ if (mode === 'scene') {
   }
 }
 if (!times) {
-  // evenly spaced, biased off the exact endpoints so we never land on a black frame
-  times = Array.from({ length: n }, (_, i) => from + span * ((i + 0.5) / n));
+  // evenly spaced, biased off the exact endpoints so we never land on a black frame.
+  // With the fps known that spacing is measured in frames rather than seconds (see
+  // frameTime): every sample then lands on a distinct real frame, so asking for the
+  // capped count returns exactly the capped count instead of one short.
+  times = maxFrames
+    ? Array.from({ length: n }, (_, i) => frameTime(Math.floor(((i + 0.5) * maxFrames) / n)))
+    : Array.from({ length: n }, (_, i) => from + span * ((i + 0.5) / n));
 }
 times = [...new Set(times.map((t) => +t.toFixed(3)))].sort((a, b) => a - b).slice(0, n);
 
@@ -418,9 +451,17 @@ if (!frames.length) {
 
 const sheets = [];
 if (sheetSpec) {
-  const [cols, rows] = String(sheetSpec === true ? '3x3' : sheetSpec)
-    .split('x')
-    .map((v) => Math.max(1, parseInt(v, 10) || 3));
+  // the same two traps as the other numeric flags, on the one flag that was missed:
+  // `parseInt(v) || 3` read an explicit 0 as "absent" and handed back the 3 default, and
+  // a spec with no 'x' in it (--sheet 4) left rows undefined, so per was NaN, the loop
+  // below never ran and the run produced no sheets at all without saying a word
+  const parts = String(sheetSpec === true ? '3x3' : sheetSpec).split('x');
+  const dim = (v) => {
+    const k = parseInt(v, 10);
+    return Math.max(1, Number.isFinite(k) ? k : 3);
+  };
+  const cols = dim(parts[0]);
+  const rows = dim(parts[1]);
   const per = cols * rows;
   const seqDir = join(outDir, '_seq');
   for (let s = 0; s * per < frames.length; s++) {

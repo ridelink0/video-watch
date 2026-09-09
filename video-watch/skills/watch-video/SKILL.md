@@ -18,11 +18,12 @@ Common flags:
 | flag | meaning |
 |---|---|
 | `--n 24` | how many frames (default 24) |
-| `--mode scene` | sample at scene changes instead of evenly - best for edited clips and UI recordings |
+| `--mode scene` | sample at scene changes instead of evenly - best for edited clips and UI recordings. Keeps every cut it finds and tops the rest of `--n` up with evenly spaced frames, so a slow clip still gets full coverage |
 | `--sheet 3x3` | also build contact sheets: 9 frames per image, one Read each |
 | `--label` | burn the timestamp into each frame |
 | `--width 960` | frame width in px (default 960) |
-| `--from S --to S` | only this time range |
+| `--from T --to T` | only this time range - seconds (`90`) or a clock (`1:30`, `00:01:30`) |
+| `--threshold F` | scene-change sensitivity for `--mode scene` (default 0.3, lower finds more cuts) |
 | `--out DIR` | where frames go (default: the OS temp dir, under `video-watch/<slug>`) |
 | `--force` | let `--out` overwrite a non-empty directory (refused otherwise) |
 | `--json` | machine-readable manifest |

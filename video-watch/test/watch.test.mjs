@@ -28,6 +28,7 @@ let rotatedMp4; // 640x360 carrying a Display Matrix - the real-world phone/scre
 let rotatedMkv; // same idea via the legacy "rotate" stream tag (matroska keeps it as ROTATE)
 let scenes; // three visually distinct segments -> two real cuts
 let six; // six equal one-second segments -> five cuts at 1s..5s, evenly spaced
+let tail; // last cut one frame before the end -> a run-out gap only one frame wide
 
 before(() => {
   root = mkdtempSync(join(tmpdir(), 'vw-test-'));
@@ -73,6 +74,18 @@ before(() => {
     '-f', 'lavfi', '-i', 'smptebars=size=320x240:rate=10:duration=1',
     '-filter_complex', '[0:v][1:v][2:v][3:v][4:v][5:v]concat=n=6:v=1:a=0[v]', '-map', '[v]',
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', six,
+  ]);
+
+  // 1.0s + 0.9s + 0.1s at 10fps: cuts at 1.0s and 1.9s, so the stretch after the last
+  // cut holds exactly one frame - the case where a fill lands past the end of the clip
+  tail = join(root, 'tail.mp4');
+  run(FFMPEG, [
+    '-y',
+    '-f', 'lavfi', '-i', 'color=c=red:size=320x240:rate=10:duration=1',
+    '-f', 'lavfi', '-i', 'color=c=black:size=320x240:rate=10:duration=0.9',
+    '-f', 'lavfi', '-i', 'color=c=white:size=320x240:rate=10:duration=0.1',
+    '-filter_complex', '[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]', '-map', '[v]',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', tail,
   ]);
 });
 
@@ -177,22 +190,44 @@ test('--label survives timestamps containing colons (drawtext escaping)', () => 
 
 /* ---------- frame-count capping ---------- */
 
-test('caps --n to the distinct frames actually available', () => {
+test('caps --n to the distinct frames available and delivers exactly that many', () => {
   const dir = outDir();
-  // 2s at 10fps = ~20 distinct frames; asking for 500 must be capped, not spawn 500 extracts
+  // 2s at 10fps = 20 distinct frames; asking for 500 must be capped, not spawn 500 extracts
   const r = watch([plain, '--out', dir, '--n', '500', '--json']);
   assert.equal(r.status, 0, r.stderr);
   const capped = r.stderr.match(/exceeds the ~(\d+) distinct frames available/);
   assert.ok(capped, 'expected the cap to be announced, got: ' + r.stderr);
-  // The cap's contract is an upper bound - "capping to N" promises no more than
-  // N, not exactly N. KNOWN GAP: it announces 20 here and delivers 19, because
-  // the last evenly spaced timestamp lands on `to` (2.000s) where no frame
-  // exists, so it re-extracts the 1.9s frame and the dedupe drops it. Harmless
-  // but the message overstates by one; worth fixing properly at the sampler.
   const announced = Number(capped[1]);
   const report = JSON.parse(r.stdout);
-  assert.ok(report.frames.length <= announced, `${report.frames.length} frames exceeds the announced cap of ${announced}`);
-  assert.ok(report.frames.length >= announced - 1, `cap under-delivered badly: ${report.frames.length} of ${announced}`);
+  // The cap announced 20 and used to hand back 19: the last evenly spaced sample of a
+  // 2s 10fps clip is 1.95s, half a frame past the final frame at 1.9s, and -ss rounds
+  // FORWARD - so it decoded nothing at all and the frame silently never appeared.
+  assert.equal(report.frames.length, announced, 'announced frames must be the frames delivered');
+  // and they must be that many DIFFERENT pictures: padding the count by re-extracting
+  // the frame next door would satisfy the number while breaking what it promises
+  const hashes = new Set(report.frames.map((f) => pixelHash(f.file)));
+  assert.equal(hashes.size, announced, 'the capped frames must all be distinct pictures');
+});
+
+/* ---------- contact sheets ---------- */
+
+test('an explicit 0 in the --sheet spec is not read as the 3 default', () => {
+  const report = watchJson([six, '--out', outDir(), '--n', '4', '--sheet', '0x2']);
+  // 0 columns is meaningless so it clamps to 1; what it must NOT do is fall through
+  // `parseInt(v) || 3` and quietly build the 3-wide sheets nobody asked for
+  assert.ok(report.sheets.length, 'no sheets were built');
+  assert.equal(report.sheets[0].cols, 1);
+  assert.equal(report.sheets[0].rows, 2);
+  assert.equal(report.sheets.length, 2, '4 frames at 2 per sheet is 2 sheets');
+});
+
+test('a --sheet spec with no "x" still builds sheets instead of silently building none', () => {
+  const report = watchJson([six, '--out', outDir(), '--n', '4', '--sheet', '4']);
+  // rows came back undefined, so frames-per-sheet was NaN, the sheet loop's `s * per <
+  // frames.length` was false on the first pass, and the run produced no sheets at all
+  // without a word about why
+  assert.ok(report.sheets.length, 'no sheets were built');
+  assert.equal(report.sheets[0].cols, 4);
 });
 
 /* ---------- range validation ---------- */
@@ -229,22 +264,28 @@ test('--from/--to read hh:mm:ss', () => {
   assert.deepEqual(hms.frames.map((f) => f.t), secs.frames.map((f) => f.t));
 });
 
-test('a time that is not a number at all is rejected, not read as 0', () => {
-  // "--from later" must not quietly become 0; NaN falls back to the default, and the
-  // default from is 0 - so the only observable guard is that --to garbage does not
-  // become the full duration by accident. Check the parse directly through --to.
-  const r = watch([plain, '--from', '1', '--to', 'later', '--out', outDir(), '--n', '2']);
-  // to falls back to duration (2s), which is a valid range - it must at least not crash
-  assert.equal(r.status, 0, r.stderr);
+test('a time that is not a time at all is refused, not quietly replaced by a default', () => {
+  // falling back to the default here would sample a different window than the caller
+  // asked for and say nothing - the same silent wrongness "--from 1:30" used to cause
+  const r = watch([plain, '--from', 'later', '--out', outDir(), '--n', '2']);
+  assert.equal(r.status, 2, r.stdout);
+  assert.match(r.stderr, /--from is not a time/);
+  // a flag whose value is missing entirely must not be read as 0 either
+  const r2 = watch([plain, '--to', '--json', '--out', outDir(), '--n', '2']);
+  assert.equal(r2.status, 2, r2.stdout);
+  assert.match(r2.stderr, /--to is not a time/);
 });
 
 test('an explicit --threshold 0 is honored, not read as "use the 0.3 default"', () => {
   // threshold 0 means "every frame differs enough to be a cut": scene detection then
-  // returns far more candidates than frames asked for, so all 3 frames are cuts and
-  // nothing is filled. At the 0.3 default this same clip yields 2 cuts + 1 fill.
-  const report = watchJson([scenes, '--mode', 'scene', '--threshold', '0', '--n', '3', '--out', outDir()]);
-  assert.equal(report.mode, 'scene');
-  assert.deepEqual(report.sceneStats, { cuts: 3, fill: 0 });
+  // returns far more candidates than frames asked for, so the run is nearly all cuts.
+  // At the 0.3 default the same clip has only its two real cuts and the rest is fill -
+  // if the explicit 0 were swallowed the two runs would be indistinguishable.
+  const zero = watchJson([scenes, '--mode', 'scene', '--threshold', '0', '--n', '8', '--out', outDir()]);
+  assert.equal(zero.mode, 'scene');
+  assert.deepEqual(zero.sceneStats, { cuts: 7, fill: 1 });
+  const dflt = watchJson([scenes, '--mode', 'scene', '--n', '8', '--out', outDir()]);
+  assert.deepEqual(dflt.sceneStats, { cuts: 2, fill: 6 });
 });
 
 /* ---------- item 2: scene mode tops up to --n ---------- */
@@ -278,10 +319,23 @@ test('fill never overspends its budget and never pushes a real cut out of the ma
   }
 });
 
-test('scene mode with more cuts than --n returns exactly --n, all of them cuts', () => {
+test('scene mode with more cuts than --n still shows the opening scene', () => {
   const report = watchJson([six, '--mode', 'scene', '--n', '3', '--out', outDir()]);
   assert.equal(report.frames.length, 3);
-  assert.deepEqual(report.sceneStats, { cuts: 3, fill: 0 });
+  // a detected cut is the FIRST frame of the scene AFTER it, so a run of nothing but
+  // cuts never shows scene 1 at all. One sample goes to the run-in, and the manifest
+  // counts it as fill rather than passing it off as a cut.
+  assert.deepEqual(report.sceneStats, { cuts: 2, fill: 1 });
+  assert.ok(report.frames[0].t < 1, `nothing sampled before the first cut at 1s: ${report.frames[0].t}`);
+});
+
+test('a fill landing in the clip\'s final frame is still delivered', () => {
+  // tail.mp4's last cut is at 1.9s of a 2.0s 10fps clip, so the run-out gap is one frame
+  // wide and its midpoint (1.95s) is past the last frame - where -ss decodes nothing at
+  // all, and the frame the manifest budgeted for simply never arrived
+  const report = watchJson([tail, '--mode', 'scene', '--n', '16', '--out', outDir()]);
+  assert.equal(report.frames.length, 16, 'a budgeted fill went missing');
+  assert.equal(report.sceneStats.cuts + report.sceneStats.fill, 16);
 });
 
 test('manifest tells the truth when scene mode falls back to grid', () => {
@@ -340,6 +394,27 @@ test('the legacy rotate stream tag is honored too', () => {
   assert.equal(report.size, '360x640');
   assert.equal(report.rotation, 90);
   assert.equal(jpgSize(report.frames[0].file), '180x320');
+});
+
+test('the legacy rotate tag turns the frame clockwise, not merely to the right size', () => {
+  // There is no autorotate reference for this branch: ffmpeg does NOT autorotate on a
+  // matroska ROTATE tag (decode rotated.mkv yourself and it comes out 640x360), which is
+  // exactly why the script has to turn the frame itself. And 180x320 is 180x320 whichever
+  // way the turn went, so the dimension check above cannot catch a flipped sign.
+  // rotate=90 is defined as "turn 90 degrees clockwise to display", so a hand-written
+  // transpose=1 is the reference; transpose=2 is the wrong answer this must reject.
+  const report = watchJson([rotatedMkv, '--n', '1', '--width', '320', '--out', outDir()]);
+  const at = String(report.frames[0].t);
+  const turn = (dir) => {
+    const f = join(root, `turn${seq++}.jpg`);
+    run(FFMPEG, ['-v', 'error', '-y', '-ss', at, '-i', rotatedMkv, '-frames:v', '1',
+      '-vf', `transpose=${dir},scale=-2:320`, '-q:v', '3', f]);
+    return pixelHash(f);
+  };
+  const clockwise = turn(1);
+  // the oracle only means something if the two directions actually differ on this clip
+  assert.notEqual(clockwise, turn(2), 'fixture is rotationally symmetric - useless as proof');
+  assert.equal(pixelHash(report.frames[0].file), clockwise, 'frame was turned the wrong way');
 });
 
 test('the human-readable header says the frames were rotated', () => {
