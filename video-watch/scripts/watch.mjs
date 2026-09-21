@@ -3,7 +3,7 @@
 // Usage:
 //   node watch.mjs <video> [--n 24] [--mode grid|scene] [--width 960]
 //                          [--out DIR] [--force] [--sheet 3x3] [--from S] [--to S]
-//                          [--threshold 0.3] [--label] [--json]
+//                          [--threshold 0.3] [--label] [--json] [--dry-run]
 // Prints a manifest of frame files + timestamps. Read the frames (or sheets)
 // as images to actually see the video.
 
@@ -89,7 +89,7 @@ if (!argv.length || argv[0] === '--help' || argv[0] === '-h') {
   console.log(
     'Usage: node watch.mjs <video> [--n 24] [--mode grid|scene] [--width 960]\n' +
       '                      [--out DIR] [--force] [--sheet 3x3] [--from S] [--to S]\n' +
-      '                      [--threshold 0.3] [--label] [--json]',
+      '                      [--threshold 0.3] [--label] [--json] [--dry-run]',
   );
   process.exit(argv.length ? 0 : 1);
 }
@@ -100,12 +100,26 @@ if (!existsSync(video)) {
   process.exit(2);
 }
 
+// A trailing --out (or --mode, --width, --n, --from, --to, --threshold) with no
+// value used to come back as `true`, so `String(flag('out'))` made a directory
+// called "true" in the cwd and --mode fell through to grid without a word.
+// Those flags are refused without a value, the way --from/--to refuse a bad
+// time; --sheet and the booleans keep their bare form.
+const NEEDS_VALUE = new Set(['out', 'mode', 'width', 'n', 'from', 'to', 'threshold']);
 function flag(name, def) {
   const i = argv.indexOf('--' + name);
   if (i === -1) return def;
   const v = argv[i + 1];
-  return v === undefined || v.startsWith('--') ? true : v;
+  if (v === undefined || v.startsWith('--')) {
+    if (NEEDS_VALUE.has(name)) {
+      console.error(`video-watch: --${name} needs a value`);
+      process.exit(2);
+    }
+    return true;
+  }
+  return v;
 }
+const dryRun = argv.includes('--dry-run');
 
 // `parsed || fallback` treats an explicit 0 the same as "missing" (0 is falsy), so
 // e.g. --threshold 0 - a legitimate "flag every frame as a cut" request - silently
@@ -310,7 +324,7 @@ times = [...new Set(times.map((t) => +t.toFixed(3)))].sort((a, b) => a - b).slic
 /* ---------- extract ---------- */
 
 const outGiven = argv.includes('--out');
-if (existsSync(outDir)) {
+if (!dryRun && existsSync(outDir)) {
   // readdirSync on a file throws ENOTDIR, and the guard below was the first
   // thing to touch it - so --out pointing at a file came back as a raw stack
   // trace rather than the one-line refusal every other bad argument gets.
@@ -330,7 +344,7 @@ if (existsSync(outDir)) {
   }
   rmSync(outDir, { recursive: true, force: true });
 }
-mkdirSync(outDir, { recursive: true });
+if (!dryRun) mkdirSync(outDir, { recursive: true });
 
 const FONT =
   process.platform === 'win32'
@@ -404,7 +418,7 @@ function stamp(t) {
   return `${mm}:${ss}`;
 }
 
-function extract(t, file, label) {
+function extractArgs(t, file, label) {
   const rf = rotateFilter();
   const vf = [];
   if (rf) vf.push(rf); // rotate first - scale/crop math below is all in display-orientation terms
@@ -415,16 +429,52 @@ function extract(t, file, label) {
         `fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=6`,
     );
   }
-  const r = spawnSync(
-    FFMPEG,
-    ['-hide_banner', '-loglevel', 'error',
-     ...(rf ? ['-noautorotate'] : []), // input option: must precede -i
-     '-ss', String(t), '-i', video,
-     '-frames:v', '1', '-vf', vf.join(','), '-q:v', '3', '-y', file],
-    { encoding: 'utf8' },
-  );
+  return ['-hide_banner', '-loglevel', 'error',
+    ...(rf ? ['-noautorotate'] : []), // input option: must precede -i
+    '-ss', String(t), '-i', video,
+    '-frames:v', '1', '-vf', vf.join(','), '-q:v', '3', '-y', file];
+}
+
+function extract(t, file, label) {
+  const r = spawnSync(FFMPEG, extractArgs(t, file, label), { encoding: 'utf8' });
   r.ok = r.status === 0 && existsSync(file);
   return r;
+}
+
+// --dry-run: everything decided, nothing spawned for frames and nothing written.
+// The timestamps are the same ones a real run extracts, so a long file can be
+// checked in seconds before spending one ffmpeg call per frame.
+if (dryRun) {
+  const firstFile = join(outDir, 'f001.jpg');
+  const plan = {
+    dryRun: true,
+    ffmpeg: FFMPEG,
+    ffprobe: FFPROBE,
+    video,
+    duration: +duration.toFixed(2),
+    size: `${vw}x${vh}`,
+    codedSize: rotation ? `${codedW}x${codedH}` : undefined,
+    rotation: rotation || undefined,
+    fps,
+    codec: vs.codec_name,
+    mode: usedMode,
+    outDir,
+    times,
+    argv: extractArgs(times[0], firstFile, wantLabel ? stamp(times[0]) : null),
+    sheetSpec: sheetSpec === true ? '3x3' : sheetSpec || undefined,
+  };
+  if (asJson) {
+    console.log(JSON.stringify(plan, null, 2));
+  } else {
+    const rot = plan.rotation ? `  [rotated ${plan.rotation} clockwise from ${plan.codedSize}]` : '';
+    console.log(`${basename(video)}  ${plan.size} @ ${fps}fps  ${plan.duration}s  (${plan.codec})${rot}`);
+    console.log(`dry run: ${times.length} frames [${usedMode}] would go to ${outDir} (not created)`);
+    console.log(`ffmpeg: ${FFMPEG}\nffprobe: ${FFPROBE}`);
+    console.log(`first frame: ffmpeg ${plan.argv.join(' ')}`);
+    console.log(`\nTimestamps:`);
+    times.forEach((t, i) => console.log(`  ${String(i + 1).padStart(3)} ${stamp(t)}  (${t}s)`));
+  }
+  process.exit(0);
 }
 
 const frames = [];

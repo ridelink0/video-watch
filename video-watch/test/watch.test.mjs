@@ -13,7 +13,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -270,10 +270,11 @@ test('a time that is not a time at all is refused, not quietly replaced by a def
   const r = watch([plain, '--from', 'later', '--out', outDir(), '--n', '2']);
   assert.equal(r.status, 2, r.stdout);
   assert.match(r.stderr, /--from is not a time/);
-  // a flag whose value is missing entirely must not be read as 0 either
+  // a flag whose value is missing entirely must not be read as 0 either - the flag
+  // parser now refuses it before the time parser sees it, with the more specific message
   const r2 = watch([plain, '--to', '--json', '--out', outDir(), '--n', '2']);
   assert.equal(r2.status, 2, r2.stdout);
-  assert.match(r2.stderr, /--to is not a time/);
+  assert.match(r2.stderr, /--to needs a value/);
 });
 
 test('an explicit --threshold 0 is honored, not read as "use the 0.3 default"', () => {
@@ -422,4 +423,43 @@ test('the human-readable header says the frames were rotated', () => {
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /360x640/);
   assert.match(r.stdout, /rotated 270 clockwise from 640x360/);
+});
+
+/* ---------- --dry-run and valueless flags ---------- */
+
+test('--dry-run picks the same timestamps as the real run and writes nothing', () => {
+  const dry = outDir();
+  const plan = watchJson([plain, '--n', '5', '--dry-run', '--out', dry]);
+  assert.equal(plan.dryRun, true);
+  assert.ok(!existsSync(dry), '--out must not be created on a dry run');
+  assert.ok(plan.ffmpeg && plan.ffprobe, 'the binaries it found are part of the plan');
+  assert.equal(plan.times.length, 5);
+  // the first frame's argv is the real one: seek to the first timestamp, one frame, into --out
+  assert.ok(plan.argv.includes('-ss') && plan.argv.includes(String(plan.times[0])), plan.argv.join(' '));
+  assert.ok(plan.argv.some((a) => a.endsWith('f001.jpg')));
+  const real = watchJson([plain, '--n', '5', '--out', outDir()]);
+  assert.deepEqual(plan.times, real.frames.map((f) => f.t));
+  assert.equal(plan.mode, real.mode);
+  // the human-readable form says so too, and does not claim frames it did not write
+  const r = watch([plain, '--n', '3', '--dry-run', '--out', dry]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /dry run: 3 frames \[grid\]/);
+  assert.match(r.stdout, /not created/);
+  assert.ok(!existsSync(dry));
+});
+
+test('a trailing --out or --mode with no value is refused, not read as "true"', () => {
+  for (const name of ['out', 'mode', 'width', 'n', 'from', 'to', 'threshold']) {
+    const r = watch([plain, '--' + name]);
+    assert.equal(r.status, 2, name);
+    assert.match(r.stderr, new RegExp('--' + name + ' needs a value'));
+  }
+  assert.ok(!existsSync(join(process.cwd(), 'true')), 'no directory named true in the cwd');
+  // a valueless --out ahead of another flag is the same mistake
+  const r = watch([plain, '--out', '--n', '2']);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /--out needs a value/);
+  // --sheet keeps its bare form: it has a documented default
+  const ok = watchJson([plain, '--n', '2', '--sheet', '--out', outDir()]);
+  assert.equal(ok.sheets.length, 1);
 });

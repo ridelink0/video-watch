@@ -33,6 +33,7 @@ node scripts/watch.mjs <video> [options]
 | `--out DIR` | OS temp dir, under `video-watch/<slug>` | where frames are written. Refuses to touch a non-empty directory unless `--force` is given (an earlier version of this script wiped a project folder this way). Also refuses cleanly if `--out` points at an existing file. |
 | `--force` | off | allow `--out` to overwrite a non-empty directory. |
 | `--json` | off | print the manifest as JSON instead of the human-readable summary. |
+| `--dry-run` | off | probe the file, pick the timestamps and print the plan (binaries found, duration, fps, rotation, mode, every timestamp, the ffmpeg argv for the first frame) without creating `--out` or spawning a single frame extraction. With `--json` the plan is JSON. |
 
 The manifest (in both `--json` and plain-text form) always states what the run
 actually did: which mode was used (including a fallback from `scene` to
@@ -61,7 +62,9 @@ CLI-only, so tests drive it as a real subprocess against small clips
 generated on the fly with `ffmpeg` (`lavfi` test patterns - nothing is
 checked into the repo), and check its exit code, stderr, JSON manifest, and
 the actual files it writes. Covers: the `--out` refusal on a populated
-directory and the `--force` override, `--out` pointing at a file, `--label`
+directory and the `--force` override, `--out` pointing at a file, a valueless
+`--out`/`--mode` being refused instead of becoming the string "true", `--dry-run`
+picking the same timestamps as the real run while writing nothing, `--label`
 surviving a timestamp's colon through ffmpeg's drawtext escaping, `--n`
 capping to the frames actually available, `--from`/`--to` range validation
 (including an explicit `0` not being swallowed and an unreadable time being
