@@ -13,7 +13,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +29,8 @@ let rotatedMkv; // same idea via the legacy "rotate" stream tag (matroska keeps 
 let scenes; // three visually distinct segments -> two real cuts
 let six; // six equal one-second segments -> five cuts at 1s..5s, evenly spaced
 let tail; // last cut one frame before the end -> a run-out gap only one frame wide
+let hd; // 1920x1080, the size the vision docs' own resize table starts from
+let grain; // 1920x1080 noise: a frame that encodes past Claude Code's 512000-byte Read budget
 
 before(() => {
   root = mkdtempSync(join(tmpdir(), 'vw-test-'));
@@ -86,6 +88,18 @@ before(() => {
     '-f', 'lavfi', '-i', 'color=c=white:size=320x240:rate=10:duration=0.1',
     '-filter_complex', '[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]', '-map', '[v]',
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', tail,
+  ]);
+
+  hd = join(root, 'hd.mp4');
+  run(FFMPEG, [
+    '-y', '-f', 'lavfi', '-i', 'testsrc2=size=1920x1080:rate=5:duration=2',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', hd,
+  ]);
+
+  grain = join(root, 'grain.mp4');
+  run(FFMPEG, [
+    '-y', '-f', 'lavfi', '-i', 'testsrc2=size=1920x1080:rate=5:duration=1,noise=alls=60:allf=t',
+    '-c:v', 'libx264', '-crf', '12', '-pix_fmt', 'yuv420p', grain,
   ]);
 });
 
@@ -449,7 +463,7 @@ test('--dry-run picks the same timestamps as the real run and writes nothing', (
 });
 
 test('a trailing --out or --mode with no value is refused, not read as "true"', () => {
-  for (const name of ['out', 'mode', 'width', 'n', 'from', 'to', 'threshold']) {
+  for (const name of ['out', 'mode', 'width', 'tokens', 'n', 'from', 'to', 'threshold']) {
     const r = watch([plain, '--' + name]);
     assert.equal(r.status, 2, name);
     assert.match(r.stderr, new RegExp('--' + name + ' needs a value'));
@@ -462,4 +476,119 @@ test('a trailing --out or --mode with no value is refused, not read as "true"', 
   // --sheet keeps its bare form: it has a documented default
   const ok = watchJson([plain, '--n', '2', '--sheet', '--out', outDir()]);
   assert.equal(ok.sheets.length, 1);
+});
+
+test("a value that is not a number is refused, not replaced by the default", () => {
+  // --n ten used to become 24 and --width 1080p the default size, with no word said
+  for (const [name, value] of [["n", "ten"], ["width", "1080p"], ["tokens", "lots"], ["threshold", "high"]]) {
+    const r = watch([plain, "--" + name, value, "--out", outDir()]);
+    assert.equal(r.status, 2, name);
+    assert.match(r.stderr, new RegExp("--" + name + " must be a number"));
+  }
+});
+
+test("an unknown --mode is refused instead of quietly running grid", () => {
+  const r = watch([plain, "--mode", "scenes", "--n", "2", "--out", outDir()]);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /--mode must be grid or scene \(got scenes\)/);
+});
+
+/* ---------- sizing to Claude's vision budget ---------- */
+
+// Anthropic's rule (platform.claude.com/docs/en/build-with-claude/vision): one visual
+// token per 28x28 patch; the standard tier resizes past a 1568px edge or 1568 tokens
+const tokensOf = (w, h) => Math.ceil(w / 28) * Math.ceil(h / 28);
+const dims = (s) => s.split("x").map(Number);
+function assertFitsStandardTier(size, what) {
+  const [w, h] = dims(size);
+  assert.ok(Math.ceil(w / 28) * 28 <= 1568 && Math.ceil(h / 28) * 28 <= 1568, what + " edge over 1568: " + size);
+  assert.ok(tokensOf(w, h) <= 1568, what + " costs " + tokensOf(w, h) + " tokens, over 1568: " + size);
+}
+
+test("the default frame is the largest size the standard tier takes without resizing", () => {
+  const report = watchJson([hd, "--n", "1", "--out", outDir()]);
+  // the docs' own table: 1920x1080 on the standard tier is resized to 1456x819 (1560
+  // tokens); 819 is odd, and an even frame one row shorter costs the same 1560
+  assert.equal(report.frameSize, "1456x818");
+  assert.equal(report.tokensPerFrame, 1560);
+  assert.equal(jpgSize(report.frames[0].file), report.frameSize, "the manifest must state the real size");
+  assertFitsStandardTier(report.frameSize, "frame");
+});
+
+test("--tokens raises the budget for a high-resolution-tier model", () => {
+  // 1920x1080 fits the 4784-token tier as it is (2691 tokens, per the docs table)
+  const report = watchJson([hd, "--n", "1", "--tokens", "4784", "--out", outDir()]);
+  assert.equal(report.frameSize, "1920x1080");
+  assert.equal(report.tokensPerFrame, 2691);
+  assert.equal(jpgSize(report.frames[0].file), "1920x1080");
+});
+
+test("--tokens past 4784 is clamped to it, with a word, not spent on pixels that are thrown away", () => {
+  const r = watch([hd, "--n", "1", "--tokens", "9000", "--dry-run", "--json", "--out", outDir()]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /--tokens 9000 is over 4784/);
+  const plan = JSON.parse(r.stdout);
+  assert.ok(plan.tokensPerFrame <= 4784, "frame costs " + plan.tokensPerFrame);
+});
+
+test("--width alone keeps its meaning: the long edge, never upscaled", () => {
+  const report = watchJson([hd, "--n", "1", "--width", "960", "--out", outDir()]);
+  assert.equal(report.frameSize, "960x540");
+  assert.equal(jpgSize(report.frames[0].file), "960x540");
+  const small = watchJson([plain, "--n", "1", "--width", "4000", "--out", outDir()]);
+  assert.equal(jpgSize(small.frames[0].file), "320x240");
+});
+
+test("a contact sheet is sized to the same budget as a frame, margins included", () => {
+  // a 3x3 sheet of 960px frames used to come out 1944px wide - past the 1568 edge, so the
+  // API resampled it and the extra pixels were paid for in bytes and thrown away
+  const report = watchJson([hd, "--n", "9", "--sheet", "3x3", "--out", outDir()]);
+  assert.equal(report.sheets.length, 1);
+  const s = report.sheets[0];
+  assert.equal(jpgSize(s.file), s.size, "the manifest must state the real sheet size");
+  assert.equal(s.tokens, tokensOf(...dims(s.size)));
+  assertFitsStandardTier(s.size, "sheet");
+  // and it spends the budget rather than leaving most of it unused
+  assert.ok(s.tokens > 1400, "sheet only uses " + s.tokens + " of 1568 tokens");
+});
+
+test("the last sheet drops the rows it has no frames for", () => {
+  // 4 frames at 3x3 used to be a sheet one third empty tiles, priced as a full sheet
+  const report = watchJson([hd, "--n", "4", "--sheet", "3x3", "--out", outDir()]);
+  assert.equal(report.sheets.length, 1);
+  assert.equal(report.sheets[0].cols, 3);
+  assert.equal(report.sheets[0].rows, 2);
+  assert.equal(jpgSize(report.sheets[0].file), report.sheets[0].size);
+  assertFitsStandardTier(report.sheets[0].size, "sheet");
+});
+
+test("a portrait clip's sheet keeps portrait tiles and still fits the budget", () => {
+  const report = watchJson([rotatedMp4, "--n", "4", "--sheet", "2x2", "--out", outDir()]);
+  const s = report.sheets[0];
+  assert.equal(jpgSize(s.file), s.size);
+  assertFitsStandardTier(s.size, "sheet");
+  const [w, h] = dims(s.size);
+  assert.ok(h > w, "2x2 portrait tiles make a portrait sheet, got " + s.size);
+});
+
+test("a frame over Claude Code's 512000-byte Read budget is re-encoded once, from the source", () => {
+  // Claude Code 2.1.282's Read re-encodes any image over 512000 bytes - a second lossy
+  // pass. Grain encodes past that at -q:v 3, so the frame is re-extracted coarser instead.
+  const r = watch([grain, "--n", "2", "--out", outDir(), "--json"]);
+  assert.equal(r.status, 0, r.stderr);
+  const report = JSON.parse(r.stdout);
+  assert.match(r.stderr, /re-encoded from the source at -q:v \d+/);
+  for (const f of report.frames) {
+    assert.ok(statSync(f.file).size <= 512000, f.file + " is " + statSync(f.file).size + " bytes");
+    assert.ok(f.q > 3, "the manifest must say the frame was re-encoded");
+  }
+  // an ordinary frame is untouched and carries no q
+  const plainReport = watchJson([hd, "--n", "1", "--out", outDir()]);
+  assert.equal(plainReport.frames[0].q, undefined);
+});
+
+test("--dry-run states the frame size and its token cost", () => {
+  const plan = watchJson([hd, "--n", "2", "--dry-run", "--out", outDir()]);
+  assert.equal(plan.frameSize, "1456x818");
+  assert.equal(plan.tokensPerFrame, 1560);
 });

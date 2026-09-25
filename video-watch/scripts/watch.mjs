@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // video-watch - turn a video file into readable image frames.
 // Usage:
-//   node watch.mjs <video> [--n 24] [--mode grid|scene] [--width 960]
+//   node watch.mjs <video> [--n 24] [--mode grid|scene] [--tokens 1568] [--width PX]
 //                          [--out DIR] [--force] [--sheet 3x3] [--from S] [--to S]
 //                          [--threshold 0.3] [--label] [--json] [--dry-run]
 // Prints a manifest of frame files + timestamps. Read the frames (or sheets)
@@ -87,7 +87,7 @@ if (!FFMPEG || !FFPROBE) {
 const argv = process.argv.slice(2);
 if (!argv.length || argv[0] === '--help' || argv[0] === '-h') {
   console.log(
-    'Usage: node watch.mjs <video> [--n 24] [--mode grid|scene] [--width 960]\n' +
+    'Usage: node watch.mjs <video> [--n 24] [--mode grid|scene] [--tokens 1568] [--width PX]\n' +
       '                      [--out DIR] [--force] [--sheet 3x3] [--from S] [--to S]\n' +
       '                      [--threshold 0.3] [--label] [--json] [--dry-run]',
   );
@@ -105,7 +105,7 @@ if (!existsSync(video)) {
 // called "true" in the cwd and --mode fell through to grid without a word.
 // Those flags are refused without a value, the way --from/--to refuse a bad
 // time; --sheet and the booleans keep their bare form.
-const NEEDS_VALUE = new Set(['out', 'mode', 'width', 'n', 'from', 'to', 'threshold']);
+const NEEDS_VALUE = new Set(['out', 'mode', 'width', 'tokens', 'n', 'from', 'to', 'threshold']);
 function flag(name, def) {
   const i = argv.indexOf('--' + name);
   if (i === -1) return def;
@@ -123,15 +123,68 @@ const dryRun = argv.includes('--dry-run');
 
 // `parsed || fallback` treats an explicit 0 the same as "missing" (0 is falsy), so
 // e.g. --threshold 0 - a legitimate "flag every frame as a cut" request - silently
-// became the 0.3 default. Number.isFinite tells "absent/garbage" from "really zero".
+// became the 0.3 default. Number.isFinite tells "absent" from "really zero".
+// A value that is there but is not a number (--n ten, --width 1080p) used to fall back
+// to the default without a word - the run then sampled 24 frames at the default size
+// while the caller believed it had asked for something else. Refused, like a bad time.
 function numFlag(name, def, parseFn) {
-  const parsed = parseFn(flag(name, String(def)));
-  return Number.isFinite(parsed) ? parsed : def;
+  const raw = flag(name, undefined);
+  if (raw === undefined) return def;
+  const parsed = parseFn(raw);
+  if (!Number.isFinite(parsed) || !/^\s*[-+]?(\d+\.?\d*|\.\d+)\s*$/.test(String(raw))) {
+    console.error(`video-watch: --${name} must be a number (got ${raw})`);
+    process.exit(2);
+  }
+  return parsed;
 }
 
 let n = Math.max(1, numFlag('n', 24, (v) => parseInt(v, 10))); // may be capped once fps/span are known
+// An unrecognised --mode used to fall through to grid without a word, so `--mode
+// scenes` - or any typo of "scene" - quietly sampled evenly and the caller only
+// found out by noticing "[grid]" in the manifest. Refused for the same reason a
+// valueless flag is: loudly wrong beats quietly wrong.
+const MODES = new Set(['grid', 'scene']);
 const mode = String(flag('mode', 'grid'));
-const width = Math.max(160, numFlag('width', 960, (v) => parseInt(v, 10)));
+if (!MODES.has(mode)) {
+  console.error(`video-watch: --mode must be grid or scene (got ${mode})`);
+  process.exit(2);
+}
+// Frame size is set by what Claude pays for, not by a guessed pixel width. Anthropic's
+// vision docs (platform.claude.com/docs/en/build-with-claude/vision, and
+// .../vision-coordinates, read 2026-09-25):
+//   - an image costs ceil(w/28) * ceil(h/28) visual tokens (one per 28x28 patch);
+//   - the standard tier (every model before Claude 4.7) downsizes anything over a 1568px
+//     edge or 1568 visual tokens; the high-resolution tier (Claude 4.7 and later) allows
+//     2576px and 4784 tokens;
+//   - a request holding more than 20 images rejects any image over 2000px on a side.
+// So the default frame is the largest size, at the clip's own aspect ratio, that the
+// standard tier accepts WITHOUT resizing (a 16:9 clip lands at 1456x818, ~1560 tokens):
+// every current model then sees exactly the pixels written here, with no server-side
+// resample and no bytes spent on detail that is thrown away. The old 960px default used
+// ~700 tokens for a 16:9 frame, but at half the linear resolution of a 1080p screen
+// recording - small UI text, the thing these recordings are usually watched for, did not
+// survive it. --tokens raises the budget for a high-resolution-tier model; the edge then
+// stops at 2000px, the many-image limit above, because a watch run is always many images.
+const PATCH = 28;
+const STANDARD_TOKENS = 1568;
+const STANDARD_EDGE = 1568;
+const MANY_IMAGE_EDGE = 2000;
+const widthGiven = argv.includes('--width');
+const tokensGiven = argv.includes('--tokens');
+const width = widthGiven ? Math.max(160, numFlag('width', 0, (v) => parseInt(v, 10))) : 0;
+// 4784 is the largest budget any model takes (the high-resolution tier); past it the
+// server downsizes, so a bigger number would only buy bytes that are thrown away
+const HIRES_TOKENS = 4784;
+const tokensAsked = Math.max(64, numFlag('tokens', STANDARD_TOKENS, (v) => parseInt(v, 10)));
+const tokenBudget = Math.min(HIRES_TOKENS, tokensAsked);
+if (tokensAsked > HIRES_TOKENS) {
+  console.error(`video-watch: --tokens ${tokensAsked} is over ${HIRES_TOKENS}, the most any Claude model reads per image; using ${HIRES_TOKENS}`);
+}
+if (width > MANY_IMAGE_EDGE) {
+  console.error(
+    `video-watch: --width ${width} is over ${MANY_IMAGE_EDGE}px - the API rejects such an image once a request holds more than 20 images, and Claude Code's Read scales it to ${MANY_IMAGE_EDGE}px by default anyway`,
+  );
+}
 const threshold = numFlag('threshold', 0.3, parseFloat);
 const wantLabel = argv.includes('--label');
 const asJson = argv.includes('--json');
@@ -383,11 +436,76 @@ const codedH = vs.height || 0;
 const vw = swapped ? codedH : codedW;
 const vh = swapped ? codedW : codedH;
 const portrait = vh > vw;
-function frameScale(w) {
-  if (!vw || !vh) return `scale=${w}:-2`; // dimensions unknown - fall back to the old behavior
-  const target = Math.min(w, Math.max(vw, vh));
-  return portrait ? `scale=-2:${target}` : `scale=${target}:-2`;
+
+/* ---------- sizing to Claude's vision budget ---------- */
+
+const visualTokens = (w, h) => Math.ceil(w / PATCH) * Math.ceil(h / PATCH);
+// Python-style round (ties to even), as the docs' reference implementation specifies:
+// the API resolves exact .5 ties toward the even neighbour.
+function roundHalfEven(v) {
+  const f = Math.floor(v);
+  if (v - f !== 0.5) return Math.round(v);
+  return f % 2 === 0 ? f : f + 1;
 }
+// Anthropic's reference resize (vision-coordinates, "Resize your image before
+// uploading"): the largest aspect-preserving size whose 28px-padded edges fit maxEdge
+// and whose patch count fits maxTokens. Returns the input unchanged when it already fits.
+function fitsBudget(w, h, maxEdge, maxTokens) {
+  return Math.ceil(w / PATCH) * PATCH <= maxEdge && Math.ceil(h / PATCH) * PATCH <= maxEdge &&
+    visualTokens(w, h) <= maxTokens;
+}
+function fitSize(w, h, maxEdge, maxTokens) {
+  if (fitsBudget(w, h, maxEdge, maxTokens)) return [w, h];
+  if (h > w) {
+    const [rh, rw] = fitSize(h, w, maxEdge, maxTokens);
+    return [rw, rh];
+  }
+  const aspect = w / h;
+  let lo = 1;
+  let hi = w;
+  while (lo + 1 < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (fitsBudget(mid, Math.max(roundHalfEven(mid / aspect), 1), maxEdge, maxTokens)) lo = mid;
+    else hi = mid;
+  }
+  return [lo, Math.max(roundHalfEven(lo / aspect), 1)];
+}
+// yuv420 JPEG wants even dimensions; rounding DOWN can only lower the patch count, so an
+// evened size still fits whatever budget the unevened one did
+const evenDown = (v) => Math.max(2, Math.floor(v / 2) * 2);
+
+// The edge that goes with the token budget: the standard tier's 1568px for the default
+// budget, the many-image 2000px for anything larger (see the note at --tokens).
+const budgetEdge = tokenBudget > STANDARD_TOKENS ? MANY_IMAGE_EDGE : STANDARD_EDGE;
+
+// The exact frame size, decided once, so the manifest can state what each frame costs.
+// --width alone keeps its old meaning (the long edge, never upscaled); --tokens alone,
+// or neither, fits the budget; both together fit the budget inside that long edge.
+function pickFrameSize() {
+  if (!vw || !vh) return null; // dimensions unknown - ffmpeg sizes it, the manifest says so
+  const srcLong = Math.max(vw, vh);
+  const long = widthGiven ? Math.min(width, srcLong) : srcLong;
+  let w = portrait ? Math.round((vw * long) / vh) : long;
+  let h = portrait ? long : Math.round((vh * long) / vw);
+  if (!widthGiven || tokensGiven) [w, h] = fitSize(w, h, budgetEdge, tokenBudget);
+  return [evenDown(w), evenDown(h)];
+}
+const frameSize = pickFrameSize();
+function frameScale() {
+  if (!frameSize) return `scale=${width || 1456}:-2`;
+  return `scale=${frameSize[0]}:${frameSize[1]}`;
+}
+
+// Claude Code's Read tool re-encodes an image over 512000 bytes (read from the bundled
+// source of Claude Code 2.1.282: FileRead's byte budget UCe=512000, then a JPEG quality
+// search) - a second lossy pass, which Anthropic's docs single out as harmful ("especially
+// when multiple compression passes are applied"). Real footage at the default size is far
+// under it (a 4K clip's frames measured 26-84 KB at 1456x818); film grain or noise can
+// pass it, and then the frame is re-extracted from the SOURCE at a coarser quantiser, so
+// it is still only ever compressed once.
+const MAX_IMAGE_BYTES = 512000;
+const QUALITY_STEPS = [3, 5, 8, 12, 18, 25];
+
 // Rotate explicitly rather than leaning on ffmpeg's autorotate: autorotate ignores the
 // legacy "rotate" tag (matroska), and the frameScale math above is written in display
 // terms, so the two must not disagree about whether the frame arrived turned. When this
@@ -418,27 +536,43 @@ function stamp(t) {
   return `${mm}:${ss}`;
 }
 
-function extractArgs(t, file, label) {
+function extractArgs(t, file, label, q = QUALITY_STEPS[0]) {
   const rf = rotateFilter();
   const vf = [];
   if (rf) vf.push(rf); // rotate first - scale/crop math below is all in display-orientation terms
-  vf.push(frameScale(width));
+  vf.push(frameScale());
   if (label) {
+    // sized off the frame's short edge (4%, never under the old fixed 22px) so the stamp
+    // is still legible once a frame is shrunk to a third of its width in a 3x3 sheet
+    const fs = frameSize ? Math.max(22, Math.round(Math.min(...frameSize) * 0.04)) : 22;
+    const pad = Math.round(fs * 0.45);
     vf.push(
-      `drawtext=fontfile='${FONT}':text='${escapeDrawtext(label)}':x=10:y=10:fontsize=22:` +
-        `fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=6`,
+      `drawtext=fontfile='${FONT}':text='${escapeDrawtext(label)}':x=${pad}:y=${pad}:fontsize=${fs}:` +
+        `fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=${Math.round(fs * 0.27)}`,
     );
   }
   return ['-hide_banner', '-loglevel', 'error',
     ...(rf ? ['-noautorotate'] : []), // input option: must precede -i
     '-ss', String(t), '-i', video,
-    '-frames:v', '1', '-vf', vf.join(','), '-q:v', '3', '-y', file];
+    '-frames:v', '1', '-vf', vf.join(','), '-q:v', String(q), '-y', file];
+}
+
+// Runs one encode per quality step until the file fits MAX_IMAGE_BYTES. Every attempt
+// starts from the same input (the video for a frame, the frames for a sheet), never
+// from the previous attempt's output, so no retry stacks a compression pass on another.
+function encodeUnderBudget(argsFor, file) {
+  let r;
+  for (const q of QUALITY_STEPS) {
+    r = spawnSync(FFMPEG, argsFor(q), { encoding: 'utf8' });
+    r.ok = r.status === 0 && existsSync(file);
+    r.q = q;
+    if (!r.ok || statSync(file).size <= MAX_IMAGE_BYTES) return r;
+  }
+  return r; // the coarsest step is still over: keep it, Read will squeeze it the rest of the way
 }
 
 function extract(t, file, label) {
-  const r = spawnSync(FFMPEG, extractArgs(t, file, label), { encoding: 'utf8' });
-  r.ok = r.status === 0 && existsSync(file);
-  return r;
+  return encodeUnderBudget((q) => extractArgs(t, file, label, q), file);
 }
 
 // --dry-run: everything decided, nothing spawned for frames and nothing written.
@@ -458,6 +592,8 @@ if (dryRun) {
     fps,
     codec: vs.codec_name,
     mode: usedMode,
+    frameSize: frameSize ? `${frameSize[0]}x${frameSize[1]}` : undefined,
+    tokensPerFrame: frameSize ? visualTokens(...frameSize) : undefined,
     outDir,
     times,
     argv: extractArgs(times[0], firstFile, wantLabel ? stamp(times[0]) : null),
@@ -469,6 +605,7 @@ if (dryRun) {
     const rot = plan.rotation ? `  [rotated ${plan.rotation} clockwise from ${plan.codedSize}]` : '';
     console.log(`${basename(video)}  ${plan.size} @ ${fps}fps  ${plan.duration}s  (${plan.codec})${rot}`);
     console.log(`dry run: ${times.length} frames [${usedMode}] would go to ${outDir} (not created)`);
+    if (frameSize) console.log(`frame size: ${plan.frameSize}, ~${plan.tokensPerFrame} visual tokens each`);
     console.log(`ffmpeg: ${FFMPEG}\nffprobe: ${FFPROBE}`);
     console.log(`first frame: ffmpeg ${plan.argv.join(' ')}`);
     console.log(`\nTimestamps:`);
@@ -489,7 +626,20 @@ for (let i = 0; i < times.length; i++) {
     console.error(`video-watch: --label extract failed (${line}), continuing without labels`);
     r = extract(t, file, null);
   }
-  if (r.ok) frames.push({ i: frames.length + 1, t, file });
+  if (r.ok) {
+    if (r.q !== QUALITY_STEPS[0]) {
+      console.error(
+        `video-watch: frame at ${stamp(t)} was over ${MAX_IMAGE_BYTES / 1000} KB at the default quality, re-encoded from the source at -q:v ${r.q}`,
+      );
+    }
+    frames.push({ i: frames.length + 1, t, file, q: r.q });
+  } else {
+    // a frame that failed used to drop out of the manifest without a word, and a run
+    // where every frame failed said only "extracted no frames" - never why
+    const line = (r.stderr || '').trim().split('\n').filter(Boolean).pop() ||
+      (r.error ? r.error.message : `ffmpeg exited ${r.status ?? r.signal} and wrote no file`);
+    console.error(`video-watch: frame at ${stamp(t)} failed: ${line}`);
+  }
 }
 
 if (!frames.length) {
@@ -513,26 +663,67 @@ if (sheetSpec) {
   const cols = dim(parts[0]);
   const rows = dim(parts[1]);
   const per = cols * rows;
+  // A sheet is one image, so it is priced like one: the whole sheet - tiles, the 6px
+  // margin and the 6px gaps - is fitted to the same budget as a frame. Before, a 3x3
+  // sheet of 960px frames came out 1944px wide: past the standard tier's 1568px edge, so
+  // the API resampled it and the pixels past the fit were paid for in bytes and thrown
+  // away. Now the sheet is exactly what the model sees. Tiles never upscale past the
+  // frame, and keep the frame's orientation (a portrait clip's tiles are portrait).
+  const MARGIN = 6;
+  const GAP = 6;
+  const [fw, fh] = frameSize || [0, 0];
+  const sheetDims = (tw, th, c, rr) => [2 * MARGIN + c * tw + (c - 1) * GAP, 2 * MARGIN + rr * th + (rr - 1) * GAP];
+  function tileFor(c, rr) {
+    if (!fw || !fh) return null;
+    // walk the tile's long edge down from the frame's until the sheet fits the budget
+    const long = Math.max(fw, fh);
+    for (let L = long; L >= 16; L -= 2) {
+      const tw = evenDown(fw >= fh ? L : (fw * L) / fh);
+      const th = evenDown(fw >= fh ? (fh * L) / fw : L);
+      const [sw, sh] = sheetDims(tw, th, c, rr);
+      if (fitsBudget(sw, sh, budgetEdge, tokenBudget)) return [tw, th];
+    }
+    return [16, 16];
+  }
   const seqDir = join(outDir, '_seq');
   for (let s = 0; s * per < frames.length; s++) {
     const chunk = frames.slice(s * per, s * per + per);
+    // the last sheet keeps the column count but drops the rows it has nothing for:
+    // 24 frames at 3x3 used to end on a sheet that was one third empty tiles, priced as
+    // a full sheet. Now it is 3x2: cheaper (a 16:9 clip's 3x2 is ~1230 tokens against
+    // ~1560 for 3x3), with tiles as large as the edge limit then allows.
+    const rowsHere = Math.min(rows, Math.ceil(chunk.length / cols));
+    const tile = tileFor(cols, rowsHere);
+    // dimensions unknown (no frameSize): fall back to the old width-per-column sizing
+    const tileScale = tile ? `scale=${tile[0]}:${tile[1]}` : `scale=${Math.round(1456 / cols) * 2}:-2`;
     if (existsSync(seqDir)) rmSync(seqDir, { recursive: true, force: true });
     mkdirSync(seqDir, { recursive: true });
     chunk.forEach((f, k) =>
       renameSync(f.file, join(seqDir, `s${String(k + 1).padStart(3, '0')}.jpg`)),
     );
     const sheet = join(outDir, `sheet${s + 1}.jpg`);
-    const r = spawnSync(
-      FFMPEG,
-      ['-hide_banner', '-loglevel', 'error', '-start_number', '1',
-       '-i', join(seqDir, 's%03d.jpg'),
-       '-vf', `scale=${Math.round(width / cols) * 2}:-2,tile=${cols}x${rows}:margin=6:padding=6:color=0x111111`,
-       '-frames:v', '1', '-q:v', '3', '-y', sheet],
-      { encoding: 'utf8' },
+    const r = encodeUnderBudget(
+      (q) => ['-hide_banner', '-loglevel', 'error', '-start_number', '1',
+        '-i', join(seqDir, 's%03d.jpg'),
+        '-vf', `${tileScale},tile=${cols}x${rowsHere}:margin=${MARGIN}:padding=${GAP}:color=0x111111`,
+        '-frames:v', '1', '-q:v', String(q), '-y', sheet],
+      sheet,
     );
     chunk.forEach((f, k) => renameSync(join(seqDir, `s${String(k + 1).padStart(3, '0')}.jpg`), f.file));
-    if (r.status === 0 && existsSync(sheet)) {
-      sheets.push({ file: sheet, cols, rows, frames: chunk.map((f) => f.i) });
+    if (r.ok) {
+      const size = tile ? sheetDims(tile[0], tile[1], cols, rowsHere) : null;
+      sheets.push({
+        file: sheet,
+        cols,
+        rows: rowsHere,
+        frames: chunk.map((f) => f.i),
+        size: size ? `${size[0]}x${size[1]}` : undefined,
+        tokens: size ? visualTokens(...size) : undefined,
+      });
+    } else {
+      // a sheet that failed used to vanish from the manifest without a word
+      const line = (r.stderr || '').trim().split('\n').filter(Boolean).pop() || 'unknown ffmpeg error';
+      console.error(`video-watch: contact sheet ${s + 1} failed (${line}); its frames are still listed below`);
     }
   }
   if (existsSync(seqDir)) rmSync(seqDir, { recursive: true, force: true });
@@ -558,9 +749,19 @@ const report = {
   codec: vs.codec_name,
   mode: usedMode,
   sceneStats: sceneStats || undefined, // {cuts, fill} - only meaningful when mode === 'scene'
+  // the size every frame was written at, and what one costs to Read under Anthropic's
+  // ceil(w/28)*ceil(h/28) rule - so a caller can decide what to look at before looking
+  frameSize: frameSize ? `${frameSize[0]}x${frameSize[1]}` : undefined,
+  tokensPerFrame: frameSize ? visualTokens(...frameSize) : undefined,
   outDir,
   labels: labelOk,
-  frames: frames.map((f) => ({ n: f.i, t: f.t, at: stamp(f.t), file: f.file })),
+  frames: frames.map((f) => ({
+    n: f.i,
+    t: f.t,
+    at: stamp(f.t),
+    file: f.file,
+    ...(f.q !== QUALITY_STEPS[0] && { q: f.q }), // only when it had to be re-encoded coarser
+  })),
   sheets,
 };
 
@@ -574,13 +775,15 @@ if (asJson) {
     `${basename(video)}  ${report.size} @ ${fps}fps  ${report.duration}s  (${report.codec})${rot}`,
   );
   const sceneNote = sceneStats ? ` (${sceneStats.cuts} cuts + ${sceneStats.fill} fill)` : '';
-  console.log(`${frames.length} frames [${report.mode}]${sceneNote} -> ${outDir}`);
+  const cost = report.frameSize ? `  ${report.frameSize}, ~${report.tokensPerFrame} visual tokens each` : '';
+  console.log(`${frames.length} frames [${report.mode}]${sceneNote}${cost} -> ${outDir}`);
   if (sheets.length) {
     console.log(`\nContact sheets (read these first):`);
     for (const s of sheets) {
       const a = frames.find((f) => f.i === s.frames[0]);
       const b = frames.find((f) => f.i === s.frames[s.frames.length - 1]);
-      console.log(`  ${s.file}  ${s.cols}x${s.rows}  ${stamp(a.t)}-${stamp(b.t)} (frames ${s.frames[0]}-${s.frames[s.frames.length - 1]}, left-to-right, top-to-bottom)`);
+      const sc = s.tokens ? `, ~${s.tokens} tokens` : '';
+      console.log(`  ${s.file}  ${s.cols}x${s.rows}  ${stamp(a.t)}-${stamp(b.t)} (frames ${s.frames[0]}-${s.frames[s.frames.length - 1]}, left-to-right, top-to-bottom${sc})`);
     }
   }
   console.log(`\nFrames:`);
