@@ -21,7 +21,8 @@ Common flags:
 | `--mode scene` | sample at scene changes instead of evenly - best for edited clips and UI recordings. Keeps every cut it finds and tops the rest of `--n` up with evenly spaced frames, so a slow clip still gets full coverage |
 | `--sheet 3x3` | also build contact sheets: 9 frames per image, one Read each |
 | `--label` | burn the timestamp into each frame |
-| `--width 960` | long edge of the frame in px (default 960; a portrait clip is sized on its height); never upscales past the source |
+| `--tokens 1568` | visual-token budget per image (default 1568). Frames and sheets are written at the largest size that fits it, so no model resizes them: a 16:9 clip comes out 1456x818 at ~1560 tokens. On a Claude 4.7-or-later model, `--tokens 4784` buys up to 3x the pixels (edge capped at 2000px, the API's limit once a request holds more than 20 images) |
+| `--width N` | fix the frame's long edge in px instead (a portrait clip is sized on its height); never upscales past the source |
 | `--from T --to T` | only this time range - seconds (`90`) or a clock (`1:30`, `00:01:30`) |
 | `--threshold F` | scene-change sensitivity for `--mode scene` (default 0.3, lower finds more cuts) |
 | `--out DIR` | where frames go (default: the OS temp dir, under `video-watch/<slug>`) |
@@ -31,13 +32,14 @@ Common flags:
 
 ## Read
 
-1. Read the **contact sheets** first. Nine frames per image is roughly nine times cheaper than nine reads, and it is usually enough to know what the video is.
-2. Then read individual full-size frames only for the moments that matter. Sheets lose fine detail - small text, exact colors, thin strokes - so go to the full frame for anything you need to quote or copy.
+1. Read the **contact sheets** first. A sheet costs the same ~1560 tokens as one frame (the manifest prints both), so a 3x3 sheet is nine frames for the price of one, and it is usually enough to know what the video is.
+2. Then read individual full-size frames only for the moments that matter. Sheet tiles are a third of the frame's width, so they lose fine detail - small text, exact colors, thin strokes - go to the full frame for anything you need to quote or copy.
 3. Need the bit between two frames? Re-run with `--from`/`--to` and a higher `--n`.
 
 ## Notes
 
 - Long video: `--dry-run` first to see the timestamps it would pick, then `--n 16 --sheet 4x4` for the shape of it, then zoom into a range.
 - Smooth motion or an animation you need to judge frame by frame: narrow `--from`/`--to` to a couple of seconds and raise `--n`.
+- Tight on context: `--tokens 800` halves every frame's cost; the manifest's `tokensPerFrame` says what each Read will cost before you make it.
 - Sound is not extracted. If the answer is in the audio, say so rather than guessing from the picture.
 - ffmpeg missing: `winget install --id Gyan.FFmpeg` (Windows), `brew install ffmpeg` (macOS), `apt-get install ffmpeg` (Linux). The script also finds winget's copy without a PATH refresh.
